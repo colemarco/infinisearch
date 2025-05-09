@@ -8,13 +8,19 @@ import { buildCraftingTree } from "@/lib/craftingTree";
  * RecipeFrame component for displaying recipe information
  * @param {Object} props - Component props
  * @param {Object} props.selectedItem - The selected item containing id and name
+ * @param {Function} props.onElementSelect - Callback when a node is clicked to select a new element
  * @returns {JSX.Element} RecipeFrame component
  */
-export default function RecipeFrame({ selectedItem }) {
+export default function RecipeFrame({ selectedItem, onElementSelect }) {
     const [craftingTree, setCraftingTree] = useState(null);
     const [loading, setLoading] = useState(false);
     const [scale, setScale] = useState(1);
     const transformRef = useRef(null);
+    const [renderComplete, setRenderComplete] = useState(false);
+    
+    // Prevent UI from freezing by showing loading indicator first and 
+    // deferring actual rendering until after the initial layout
+    const [isReady, setIsReady] = useState(false);
 
     // Create a global reference to the current scale that can be accessed by child components
     if (typeof window !== "undefined") {
@@ -25,21 +31,36 @@ export default function RecipeFrame({ selectedItem }) {
     useEffect(() => {
         if (!selectedItem) return;
 
+        // Reset states when selection changes
         setLoading(true);
+        setRenderComplete(false);
+        setIsReady(false);
+        setCraftingTree(null);
 
         // Use an async function to handle the tree building
         const loadTree = async () => {
             try {
                 // Get the tree from our DAG-based function (now async)
                 const tree = await buildCraftingTree(selectedItem.name);
+                
+                // Set the tree data but don't render it yet
                 setCraftingTree(tree);
-
-                // Reset the view with a slight delay to ensure components are ready
+                
+                // Delay actually showing the tree to allow the UI to remain responsive
+                // This timeout allows the loading indicator to render
                 setTimeout(() => {
-                    if (transformRef.current) {
-                        transformRef.current.resetTransform();
-                    }
-                }, 100);
+                    setIsReady(true);
+                    
+                    // Reset the view with a slight delay to ensure components are ready
+                    setTimeout(() => {
+                        if (transformRef.current) {
+                            transformRef.current.resetTransform();
+                        }
+                        // Mark rendering as complete
+                        setRenderComplete(true);
+                        setLoading(false);
+                    }, 100);
+                }, 50);
             } catch (error) {
                 console.error("Error building crafting tree:", error);
                 // Provide a fallback tree in case of errors
@@ -52,14 +73,16 @@ export default function RecipeFrame({ selectedItem }) {
                         { id: "error2", name: "Element 2", isBasic: true },
                     ],
                 });
-            } finally {
+                setIsReady(true);
                 setLoading(false);
             }
         };
 
-        // Run the async function with a small delay to prevent UI freezing
+        // Run the async function with a small delay to keep the UI responsive
         const timeoutId = setTimeout(() => {
-            loadTree();
+            requestAnimationFrame(() => {
+                loadTree();
+            });
         }, 50);
 
         return () => clearTimeout(timeoutId);
@@ -103,6 +126,13 @@ export default function RecipeFrame({ selectedItem }) {
             ) : !craftingTree ? (
                 <div className="h-full flex items-center justify-center text-gray-500">
                     No recipe available for this element
+                </div>
+            ) : !isReady ? (
+                <div className="h-full flex flex-col items-center justify-center text-gray-500 gap-2">
+                    <div className="animate-pulse">Preparing recipe view...</div>
+                    <div className="text-xs opacity-70">
+                        Calculating layout for {craftingTree?.ingredients?.length || 0} ingredients
+                    </div>
                 </div>
             ) : (
                 <TransformWrapper
@@ -186,7 +216,10 @@ export default function RecipeFrame({ selectedItem }) {
                                 position: "relative",
                             }}
                         >
-                            <DynamicRecipeTree craftingTree={craftingTree} />
+                            <DynamicRecipeTree 
+                                craftingTree={craftingTree} 
+                                onElementSelect={onElementSelect}
+                            />
                         </div>
                     </TransformComponent>
                 </TransformWrapper>
@@ -198,9 +231,10 @@ export default function RecipeFrame({ selectedItem }) {
 /**
  * Dynamic recipe tree that can handle trees of any depth
  */
-function DynamicRecipeTree({ craftingTree }) {
+function DynamicRecipeTree({ craftingTree, onElementSelect }) {
     // State to keep track of node positions
     const [nodePositions, setNodePositions] = useState({});
+    const [renderComplete, setRenderComplete] = useState(false);
     const svgRef = useRef(null);
 
     // Helper to get node size in pixels
@@ -237,333 +271,265 @@ function DynamicRecipeTree({ craftingTree }) {
         return null;
     }, []);
 
-    // Initialize node positions using a more dynamic layout algorithm
+    // Initialize node positions using a Web Worker to avoid blocking the main thread
     useEffect(() => {
         if (!craftingTree) return;
+        
+        // Reset states when tree changes
+        setNodePositions({});
+        setRenderComplete(false);
+        
+        // Only create the worker in browser environment
+        if (typeof window !== 'undefined') {
+            // Create a blob URL for the worker script
+            const workerCode = `
+                // Helper to find a node by ID in the tree
+                function findNodeById(node, id) {
+                  if (!node) return null;
+                  if (node.id === id) return node;
 
-        const initialPositions = {};
+                  if (node.ingredients && Array.isArray(node.ingredients)) {
+                    for (const child of node.ingredients) {
+                      const found = findNodeById(child, id);
+                      if (found) return found;
+                    }
+                  }
 
-        // Start at the center of our container
-        // With real data, we need more space for potentially larger trees
-        const centerX = 2500;
-        const centerY = 300; // Start even higher up to give more space for potentially deeper trees
+                  return null;
+                }
 
-        // First pass: Calculate the tree dimensions and node sizes
-        function calculateTreeDimensions(node, level = 0) {
-            if (!node)
-                return { width: 0, height: 0, nodeCount: 0, maxDepth: level };
+                // Calculate node size in pixels
+                function getNodeSizePixels(node, rootId) {
+                  if (!node || !node.name) return 60;
 
-            // Calculate this node's size based on name length
-            const nameLength = (node.name || "").length;
-            const nodeSize =
-                node.id === craftingTree.id
-                    ? Math.max(100, 80 + nameLength * 5) // Root node
-                    : node.isBasic
-                    ? Math.max(70, 60 + nameLength * 3.5) // Basic element
-                    : Math.max(80, 60 + nameLength * 4); // Compound element
+                  const nameLength = node.name.length;
 
-            // If it's a leaf node (no ingredients or empty array)
-            if (
-                !node.ingredients ||
-                !Array.isArray(node.ingredients) ||
-                node.ingredients.length === 0
-            ) {
-                return {
-                    width: nodeSize,
-                    height: nodeSize,
-                    nodeCount: 1,
-                    maxDepth: level,
+                  if (node.id === rootId) {
+                    // Root node
+                    return Math.max(100, 80 + nameLength * 5);
+                  } else if (node.isBasic) {
+                    return Math.max(70, 60 + nameLength * 3.5);
+                  } else {
+                    return Math.max(80, 60 + nameLength * 4);
+                  }
+                }
+
+                // Calculate the tree dimensions and node sizes
+                function calculateTreeDimensions(node, rootId, level = 0) {
+                  if (!node) return { width: 0, height: 0, nodeCount: 0, maxDepth: level };
+
+                  // Calculate this node's size based on name length
+                  const nodeSize = getNodeSizePixels(node, rootId);
+
+                  // If it's a leaf node (no ingredients or empty array)
+                  if (
+                    !node.ingredients ||
+                    !Array.isArray(node.ingredients) ||
+                    node.ingredients.length === 0
+                  ) {
+                    return {
+                      width: nodeSize,
+                      height: nodeSize,
+                      nodeCount: 1,
+                      maxDepth: level,
+                    };
+                  }
+
+                  // Recursively calculate dimensions for all children
+                  const childDimensions = node.ingredients.map((child) =>
+                    calculateTreeDimensions(child, rootId, level + 1)
+                  );
+
+                  // Sum up the total width of all children
+                  const totalChildWidth = childDimensions.reduce(
+                    (sum, dim) => sum + dim.width,
+                    0
+                  );
+
+                  // Find the maximum depth in the subtree
+                  const maxChildDepth = Math.max(
+                    ...childDimensions.map((dim) => dim.maxDepth),
+                    level
+                  );
+
+                  // Count total nodes in the subtree
+                  const totalNodeCount =
+                    1 + childDimensions.reduce((sum, dim) => sum + dim.nodeCount, 0);
+
+                  // The node's subtree width is the max of its own width and its children's total width
+                  const subtreeWidth = Math.max(nodeSize, totalChildWidth);
+
+                  // Height is based on the deepest path
+                  const subtreeHeight =
+                    nodeSize + (maxChildDepth > level ? maxChildDepth - level : 0) * 150;
+
+                  return {
+                    width: subtreeWidth,
+                    height: subtreeHeight,
+                    nodeCount: totalNodeCount,
+                    maxDepth: maxChildDepth,
+                  };
+                }
+
+                // Calculate node positions
+                function calculateNodePositions(craftingTree) {
+                  if (!craftingTree) return {};
+
+                  const initialPositions = {};
+
+                  // Start at the center of our container
+                  const centerX = 2500;
+                  const centerY = 300; // Start higher up to give more space for deeper trees
+
+                  // Calculate overall tree dimensions
+                  const treeDimensions = calculateTreeDimensions(craftingTree, craftingTree.id);
+
+                  // Position nodes based on calculated dimensions
+                  function positionNodes(
+                    node,
+                    x,
+                    y,
+                    availableWidth,
+                    level = 0,
+                    index = 0
+                  ) {
+                    if (!node) return;
+
+                    // Store this node's position
+                    const nodeId = node.id || \`node-\${level}-\${index}\`;
+                    initialPositions[nodeId] = { x, y };
+
+                    // If this is a leaf node, we're done
+                    if (
+                      !node.ingredients ||
+                      !Array.isArray(node.ingredients) ||
+                      node.ingredients.length === 0
+                    ) {
+                      return;
+                    }
+
+                    // Calculate vertical spacing - increases with depth for real data graphs
+                    const verticalSpacing = 180 + level * 15;
+
+                    // Divide available width among children proportionally to their subtree sizes
+                    let childrenDimensions = node.ingredients.map((child) =>
+                      calculateTreeDimensions(child, craftingTree.id, level + 1)
+                    );
+
+                    // Calculate total width of all children
+                    const totalChildWidth = childrenDimensions.reduce(
+                      (sum, dim) => sum + dim.width,
+                      0
+                    );
+
+                    // Calculate a minimum spacing between siblings
+                    const minSiblingSpacing = 120; 
+
+                    // Factor for width distribution
+                    const widthDistributionFactor = 2.0;
+
+                    // Total width including spacing
+                    const effectiveWidth = Math.max(
+                      availableWidth,
+                      totalChildWidth * widthDistributionFactor +
+                        (node.ingredients.length - 1) * minSiblingSpacing
+                    );
+
+                    // Start positioning from the left edge of the available space
+                    let currentX = x - effectiveWidth / 2;
+
+                    // Position each child
+                    node.ingredients.forEach((child, idx) => {
+                      if (!child) return;
+
+                      const childDim = childrenDimensions[idx];
+
+                      // Allocate width proportionally
+                      const childAvailableWidth =
+                        (childDim.width / totalChildWidth) * effectiveWidth;
+
+                      // Calculate child position
+                      const childX = currentX + childAvailableWidth / 2;
+                      const childY = y + verticalSpacing;
+
+                      // Recursively position the child and its subtree
+                      positionNodes(
+                        child,
+                        childX,
+                        childY,
+                        childAvailableWidth,
+                        level + 1,
+                        idx
+                      );
+
+                      // Move currentX for the next child
+                      currentX += childAvailableWidth;
+                    });
+                  }
+
+                  // Start positioning from the root
+                  positionNodes(craftingTree, centerX, centerY, treeDimensions.width);
+                  return initialPositions;
+                }
+
+                // Web Worker message handler
+                onmessage = function(e) {
+                  try {
+                    const { craftingTree } = e.data;
+                    const positions = calculateNodePositions(craftingTree);
+                    postMessage({ positions });
+                  } catch (error) {
+                    postMessage({ error: error.message || 'Error calculating positions' });
+                  }
                 };
-            }
-
-            // Recursively calculate dimensions for all children
-            const childDimensions = node.ingredients.map((child) =>
-                calculateTreeDimensions(child, level + 1)
-            );
-
-            // Sum up the total width of all children
-            const totalChildWidth = childDimensions.reduce(
-                (sum, dim) => sum + dim.width,
-                0
-            );
-
-            // Find the maximum depth in the subtree
-            const maxChildDepth = Math.max(
-                ...childDimensions.map((dim) => dim.maxDepth),
-                level
-            );
-
-            // Count total nodes in the subtree
-            const totalNodeCount =
-                1 +
-                childDimensions.reduce((sum, dim) => sum + dim.nodeCount, 0);
-
-            // The node's subtree width is the max of its own width and its children's total width
-            const subtreeWidth = Math.max(nodeSize, totalChildWidth);
-
-            // Height is based on the deepest path
-            const subtreeHeight =
-                nodeSize +
-                (maxChildDepth > level ? maxChildDepth - level : 0) * 150;
-
-            return {
-                width: subtreeWidth,
-                height: subtreeHeight,
-                nodeCount: totalNodeCount,
-                maxDepth: maxChildDepth,
+            `;
+            
+            // Create a blob with the worker code
+            const blob = new Blob([workerCode], { type: 'application/javascript' });
+            const workerUrl = URL.createObjectURL(blob);
+            
+            // Create a worker
+            const worker = new Worker(workerUrl);
+            
+            // Set up message handler
+            worker.onmessage = (e) => {
+                if (e.data.error) {
+                    console.error('Worker error:', e.data.error);
+                    // Provide a fallback positioning
+                    const fallbackPositions = { [craftingTree.id]: { x: 2500, y: 300 } };
+                    setNodePositions(fallbackPositions);
+                } else {
+                    setNodePositions(e.data.positions);
+                    // Mark rendering as complete after positions are calculated
+                    setTimeout(() => {
+                        setRenderComplete(true);
+                    }, 50);
+                }
             };
+            
+            // Send the crafting tree to the worker for processing
+            worker.postMessage({ craftingTree });
+            
+            // Clean up
+            return () => {
+                worker.terminate();
+                URL.revokeObjectURL(workerUrl);
+            };
+        } else {
+            // Fallback for SSR
+            setNodePositions({ [craftingTree.id]: { x: 2500, y: 300 } });
+            setRenderComplete(true);
         }
-
-        // Calculate overall tree dimensions
-        const treeDimensions = calculateTreeDimensions(craftingTree);
-
-        // Second pass: Position nodes based on calculated dimensions
-        function positionNodes(
-            node,
-            x,
-            y,
-            availableWidth,
-            level = 0,
-            index = 0
-        ) {
-            if (!node) return;
-
-            // Store this node's position
-            const nodeId = node.id || `node-${level}-${index}`;
-            initialPositions[nodeId] = { x, y };
-
-            // If this is a leaf node, we're done
-            if (
-                !node.ingredients ||
-                !Array.isArray(node.ingredients) ||
-                node.ingredients.length === 0
-            ) {
-                return;
-            }
-
-            // Calculate vertical spacing - increases with depth for real data graphs
-            // Use more vertical spacing for potentially deeper trees
-            const verticalSpacing = 180 + level * 15;
-
-            // Divide available width among children proportionally to their subtree sizes
-            let childrenDimensions = node.ingredients.map((child) =>
-                calculateTreeDimensions(child, level + 1)
-            );
-
-            // Calculate total width of all children
-            const totalChildWidth = childrenDimensions.reduce(
-                (sum, dim) => sum + dim.width,
-                0
-            );
-
-            // Calculate a minimum spacing between siblings to ensure they don't crowd
-            // Increase spacing for real data trees
-            const minSiblingSpacing = 120; // Increased minimum spacing between siblings
-
-            // Factor for width distribution - the larger this is, the more spread out nodes are
-            // Use a larger distribution factor for real data
-            const widthDistributionFactor = 2.0; // Increased for more spread-out layout
-
-            // Total width including spacing
-            const effectiveWidth = Math.max(
-                availableWidth,
-                totalChildWidth * widthDistributionFactor +
-                    (node.ingredients.length - 1) * minSiblingSpacing
-            );
-
-            // Start positioning from the left edge of the available space
-            let currentX = x - effectiveWidth / 2;
-
-            // Position each child
-            node.ingredients.forEach((child, idx) => {
-                if (!child) return;
-
-                const childDim = childrenDimensions[idx];
-
-                // Allocate width proportionally
-                const childAvailableWidth =
-                    (childDim.width / totalChildWidth) * effectiveWidth;
-
-                // Calculate child position
-                const childX = currentX + childAvailableWidth / 2;
-                const childY = y + verticalSpacing;
-
-                // Recursively position the child and its subtree
-                positionNodes(
-                    child,
-                    childX,
-                    childY,
-                    childAvailableWidth,
-                    level + 1,
-                    childDim.width,
-                    idx
-                );
-
-                // Move currentX for the next child
-                currentX += childAvailableWidth;
-            });
-        }
-
-        // Start positioning from the root
-        positionNodes(craftingTree, centerX, centerY, treeDimensions.width);
-        setNodePositions(initialPositions);
     }, [craftingTree]);
 
-    // Physics simulation references
-    const physicsRef = useRef(null);
-    const isPhysicsRunningRef = useRef(false);
+    // No physics simulation - nodes stay in their initially calculated positions
 
-    // Function to calculate repulsion forces between nodes
-    const applyRepulsionPhysics = useCallback((activeDragNodeId = null) => {
-        if (!craftingTree || Object.keys(nodePositions).length === 0)
-            return false;
-
-        // Clone the current positions
-        const newPositions = { ...nodePositions };
-        const nodeIds = Object.keys(newPositions);
-        let hasChanges = false;
-
-        // Process each node pair and apply repulsion forces
-        for (let i = 0; i < nodeIds.length; i++) {
-            const nodeId1 = nodeIds[i];
-            const pos1 = newPositions[nodeId1];
-
-            // Skip if this node has been deleted
-            if (!pos1) continue;
-
-            // Skip if this is the node being dragged (during active drag)
-            if (activeDragNodeId && nodeId1 === activeDragNodeId) continue;
-
-            // Get node 1 dimensions based on node size
-            const node1 = findNodeById(craftingTree, nodeId1);
-            if (!node1) continue;
-            const node1Size = getNodeSizePixels(node1);
-
-            // For each other node
-            for (let j = i + 1; j < nodeIds.length; j++) {
-                const nodeId2 = nodeIds[j];
-                const pos2 = newPositions[nodeId2];
-
-                // Skip if this node has been deleted
-                if (!pos2) continue;
-
-                // Skip if this is the node being dragged (during active drag)
-                if (activeDragNodeId && nodeId2 === activeDragNodeId) continue;
-
-                // Get node 2 dimensions
-                const node2 = findNodeById(craftingTree, nodeId2);
-                if (!node2) continue;
-                const node2Size = getNodeSizePixels(node2);
-
-                // Calculate distance between nodes
-                const dx = pos2.x - pos1.x;
-                const dy = pos2.y - pos1.y;
-                const distance = Math.sqrt(dx * dx + dy * dy);
-
-                // Determine minimum distance to avoid overlap (sum of radii plus a larger margin)
-                // With real data, use even more spacing to prevent overcrowding
-                const minDistance = node1Size / 2 + node2Size / 2 + 70; // Increased to 70 for real data
-
-                // If nodes are too close, apply repulsion
-                if (distance < minDistance && distance > 0) {
-                    hasChanges = true;
-
-                    // Calculate repulsion force
-                    // With real data, use stronger forces overall for better spacing
-                    const forceFactor = activeDragNodeId ? 0.5 : 0.35; // Increased for real data
-                    const force = (minDistance - distance) * forceFactor;
-
-                    // Direction vector
-                    const unitX = dx / distance || 0;
-                    const unitY = dy / distance || 0;
-
-                    // Apply forces to both nodes (they move away from each other)
-                    newPositions[nodeId1] = {
-                        x: pos1.x - unitX * force,
-                        y: pos1.y - unitY * force,
-                    };
-
-                    newPositions[nodeId2] = {
-                        x: pos2.x + unitX * force,
-                        y: pos2.y + unitY * force,
-                    };
-                }
-            }
-        }
-
-        // Update positions if there were changes
-        if (hasChanges) {
-            setNodePositions(newPositions);
-            return true; // Indicate that changes were made
-        }
-
-        return false; // No changes
-    }, [craftingTree, nodePositions, findNodeById, getNodeSizePixels]);
-
-    // Start physics after initial positioning
-    // Start or restart physics simulation using useCallback to prevent infinite loops
-    const startPhysicsSimulation = useCallback(() => {
-        if (Object.keys(nodePositions).length > 0) {
-            // Clear any existing interval
-            if (physicsRef.current) {
-                clearInterval(physicsRef.current);
-            }
-
-            isPhysicsRunningRef.current = true;
-            let iterationCount = 0;
-            const maxIterations = 50; // Safety limit for iterations
-
-            // Run physics simulation every 16ms (≈60fps) for smooth animation
-            physicsRef.current = setInterval(() => {
-                // Apply physics and check if any changes were made
-                const hadChanges = applyRepulsionPhysics();
-                iterationCount++;
-
-                // Stop the simulation if:
-                // 1. No more changes are needed (nodes are properly spaced), or
-                // 2. We've reached the maximum iteration count (prevents endless running)
-                if (!hadChanges || iterationCount > maxIterations) {
-                    isPhysicsRunningRef.current = false;
-                    clearInterval(physicsRef.current);
-                    physicsRef.current = null;
-                }
-            }, 16); // 16ms ≈ 60fps for smoother animation
-        }
-    }, [nodePositions, applyRepulsionPhysics]);
-
-    // Start physics after initial positioning
-    useEffect(() => {
-        if (Object.keys(nodePositions).length > 0) {
-            startPhysicsSimulation();
-        }
-
-        // Clean up physics simulation on unmount
-        return () => {
-            if (physicsRef.current) {
-                clearInterval(physicsRef.current);
-            }
-        };
-    }, [nodePositions, startPhysicsSimulation]);
-
-    // Handle dragging of a node
-    const updateNodePosition = (nodeId, newX, newY, isDragging = false) => {
+    // Handle dragging of a node - simplified without physics
+    const updateNodePosition = (nodeId, newX, newY) => {
         setNodePositions((prev) => ({
             ...prev,
             [nodeId]: { x: newX, y: newY },
         }));
-
-        // If actively dragging, apply a single iteration of physics immediately
-        if (isDragging) {
-            // We'll run a single step of physics without an interval
-            // Pass the nodeId so the physics knows which node is being dragged
-            setTimeout(() => {
-                applyRepulsionPhysics(nodeId);
-            }, 0);
-        }
-        // Otherwise restart the physics simulation when drag ends
-        else if (!isPhysicsRunningRef.current) {
-            startPhysicsSimulation();
-        }
     };
 
     // Generate SVG edges between nodes
@@ -702,6 +668,7 @@ function DynamicRecipeTree({ craftingTree }) {
                     y={pos.y}
                     isRoot={isRoot}
                     onDrag={(x, y) => updateNodePosition(node.id, x, y)}
+                    onElementClick={onElementSelect}
                 />
             );
 
@@ -720,7 +687,8 @@ function DynamicRecipeTree({ craftingTree }) {
         return allNodes;
     };
 
-    if (!craftingTree || Object.keys(nodePositions).length === 0) {
+    // Don't try to render if we don't have tree data or positions yet
+    if (!craftingTree || Object.keys(nodePositions).length === 0 || !renderComplete) {
         return (
             <div className="flex items-center justify-center h-full">
                 Initializing tree layout...
@@ -737,15 +705,18 @@ function DynamicRecipeTree({ craftingTree }) {
 }
 
 /**
- * Draggable element node component
+ * Draggable element node component that also supports clicking to navigate to the element's recipe
  */
-function ElementNode({ node, x, y, isRoot = false, onDrag }) {
+function ElementNode({ node, x, y, isRoot = false, onDrag, onElementClick }) {
     const nodeRef = useRef(null);
     const [isDragging, setIsDragging] = useState(false);
     const dragStartPosRef = useRef({ x: 0, y: 0 });
     const nodeStartPosRef = useRef({ x: 0, y: 0 });
+    const clickTimeoutRef = useRef(null);
+    const hasDraggedRef = useRef(false);
+    const dragDistanceThreshold = 5; // Threshold in pixels to distinguish click from drag
 
-    // Set up direct drag handling
+    // Set up direct drag handling with click detection
     useEffect(() => {
         const nodeElement = nodeRef.current;
         if (!nodeElement) return;
@@ -756,6 +727,9 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
 
             e.preventDefault();
             e.stopPropagation();
+
+            // Reset drag detection
+            hasDraggedRef.current = false;
 
             // Store starting positions
             dragStartPosRef.current = {
@@ -770,6 +744,15 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
 
         const handleMouseMove = (e) => {
             if (!isDragging) return;
+
+            // Calculate movement distance to distinguish between drag and click
+            const moveX = Math.abs(e.clientX - dragStartPosRef.current.mouseX);
+            const moveY = Math.abs(e.clientY - dragStartPosRef.current.mouseY);
+            
+            // If moved beyond threshold, consider it a drag
+            if (moveX > dragDistanceThreshold || moveY > dragDistanceThreshold) {
+                hasDraggedRef.current = true;
+            }
 
             e.preventDefault();
 
@@ -788,8 +771,8 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
             const newX = nodeStartPosRef.current.x + deltaX;
             const newY = nodeStartPosRef.current.y + deltaY;
 
-            // Update the node position with isDragging flag
-            onDrag(newX, newY, true);
+            // Update the node position without physics
+            onDrag(newX, newY);
 
             // Update start positions for next move
             dragStartPosRef.current = {
@@ -800,15 +783,17 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
             nodeStartPosRef.current = { x: newX, y: newY };
         };
 
-        const handleMouseUp = () => {
+        const handleMouseUp = (e) => {
             if (isDragging) {
-                // Update position one more time with isDragging=false to start the physics simulation
-                onDrag(
-                    nodeStartPosRef.current.x,
-                    nodeStartPosRef.current.y,
-                    false
-                );
                 setIsDragging(false);
+                
+                // If user barely moved mouse, consider it a click
+                if (!hasDraggedRef.current && onElementClick && node) {
+                    // Small delay to prevent accidental clicks
+                    setTimeout(() => {
+                        onElementClick(node.name);
+                    }, 10);
+                }
             }
         };
 
@@ -821,17 +806,34 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
             document.removeEventListener("mousemove", handleMouseMove);
             document.removeEventListener("mouseup", handleMouseUp);
         };
-    }, [isDragging, onDrag, x, y]);
+    }, [isDragging, onDrag, onElementClick, node, x, y]);
 
     // Generate node color and style based on node type
     const getNodeStyle = () => {
+        const clickableCursor = onElementClick ? (isDragging ? "grabbing" : "pointer") : (isDragging ? "grabbing" : "grab");
+        
+        // Special style for nodes that have been depth-limited
+        if (node.isDepthLimited) {
+            return {
+                backgroundColor: "white",
+                color: "#666",
+                cursor: clickableCursor,
+                zIndex: 10,
+                boxShadow: "0 2px 8px rgba(0, 0, 0, 0.15)",
+                border: "2px dashed #aaa",  // Visual indicator that this node is depth-limited
+                // Visual indicator for clickable state with hover effect
+                transition: "all 0.2s ease-in-out"
+            };
+        }
+        
         if (isRoot) {
             return {
                 backgroundColor: "white",
                 color: "black",
-                cursor: isDragging ? "grabbing" : "grab",
+                cursor: clickableCursor,
                 zIndex: 20,
                 boxShadow: "0 4px 12px rgba(0, 0, 0, 0.12)",
+                transition: "all 0.2s ease-in-out"
             };
         }
 
@@ -839,18 +841,20 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
             return {
                 backgroundColor: "white",
                 color: "black",
-                cursor: isDragging ? "grabbing" : "grab",
+                cursor: clickableCursor,
                 zIndex: 10,
                 boxShadow: "0 2px 6px rgba(0, 0, 0, 0.08)",
+                transition: "all 0.2s ease-in-out"
             };
         }
 
         return {
             backgroundColor: "white",
             color: "black",
-            cursor: isDragging ? "grabbing" : "grab",
+            cursor: clickableCursor,
             zIndex: 15,
             boxShadow: "0 3px 8px rgba(0, 0, 0, 0.1)",
+            transition: "all 0.2s ease-in-out"
         };
     };
 
@@ -879,26 +883,26 @@ function ElementNode({ node, x, y, isRoot = false, onDrag }) {
         alignItems: "center",
         justifyContent: "center",
         transform: `translate(-50%, -50%) translate(${x}px, ${y}px)`,
-        // When dragging, disable transition for the dragged node only
-        // For non-dragged nodes that move due to repulsion, use a faster transition
-        transition: isDragging
-            ? "none"
-            : "transform 0.05s ease-out, box-shadow 0.3s ease", // Faster transition
+        // Simple transition for box-shadow effect when dragging
+        transition: isDragging ? "none" : "box-shadow 0.3s ease"
     };
 
     return (
         <div
             ref={nodeRef}
-            className="element-node select-none"
+            className={`element-node select-none ${onElementClick ? 'hover:shadow-xl hover:scale-105' : ''}`}
             style={style}
             onMouseDown={(e) => e.stopPropagation()}
-            title={`${node.name}${node.isBasic ? " (Basic Element)" : ""}`}
+            title={`${node.name}${node.isBasic ? " (Basic Element)" : ""}${node.isDepthLimited ? " (More ingredients not shown)" : ""}${onElementClick ? " (Click to view recipe)" : ""}`}
         >
             <div
                 className="text-center font-medium"
                 style={{ fontSize: "14px", padding: "8px" }}
             >
                 {node.name}
+                {node.isDepthLimited && (
+                    <div className="text-xs text-blue-400 mt-1 font-normal">Click to view full recipe</div>
+                )}
             </div>
         </div>
     );

@@ -39,7 +39,19 @@ export default function Home() {
                     id="recipe-container"
                     className="w-full max-w-[90%] mx-auto"
                 >
-                    <RecipeFrame selectedItem={selectedItem} />
+                    <RecipeFrame 
+                        selectedItem={selectedItem} 
+                        onElementSelect={(elementName) => {
+                            // When a node is clicked, update the selected item to that element
+                            if (elementName) {
+                                // Create a new object to trigger re-render
+                                setSelectedItem({
+                                    id: `element-${Math.random().toString(36).substring(2, 9)}`,
+                                    name: elementName
+                                });
+                            }
+                        }}
+                    />
                 </div>
             )}
         </main>
